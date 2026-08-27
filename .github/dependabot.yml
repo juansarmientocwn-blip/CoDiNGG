@@ -1,0 +1,44 @@
+version: 2
+
+# ---------------------------------------------------------------------------
+#  Dependabot: parches de seguridad automáticos.
+#
+#  El bloque de github-actions es el más importante y el que casi todo el mundo
+#  olvida: una acción de terceros comprometida ejecuta código arbitrario con
+#  los secretos del repositorio. Mantenerlas al día es defensa de cadena de
+#  suministro, no mantenimiento cosmético.
+#
+#  Descomenta los ecosistemas que use tu repositorio. Un ecosistema que no
+#  existe no rompe nada, pero ensucia el registro de Dependabot.
+# ---------------------------------------------------------------------------
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [seguridad, dependencias]
+    commit-message:
+      prefix: 'seguridad(actions)'
+
+  # - package-ecosystem: npm
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  #   open-pull-requests-limit: 10
+  #   labels: [seguridad, dependencias]
+  #   groups:
+  #     parches-menores:
+  #       update-types: [minor, patch]
+
+  # - package-ecosystem: pip
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  #   labels: [seguridad, dependencias]
+
+  # - package-ecosystem: docker
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  #   labels: [seguridad, dependencias]

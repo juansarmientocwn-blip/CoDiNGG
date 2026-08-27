@@ -1,0 +1,79 @@
+name: CodeQL
+
+# ---------------------------------------------------------------------------
+#  Análisis estático de seguridad (SAST) con CodeQL.
+#
+#  La lista de lenguajes NO está escrita a mano: la calcula
+#  scripts/detect_codeql_languages.py a partir del árbol de ficheros, de modo
+#  que añadir un lenguaje nuevo al repositorio no exige tocar este workflow.
+#  Si el repositorio no tiene lenguajes soportados, la matriz queda vacía y
+#  el job de análisis se omite en lugar de fallar.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detectar:
+    name: Detectar lenguajes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matriz: ${{ steps.det.outputs.matriz }}
+      vacio: ${{ steps.det.outputs.vacio }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: det
+        run: |
+          set -euo pipefail
+          salida=$(python3 scripts/detect_codeql_languages.py .)
+          echo "$salida"
+          echo "matriz=$(echo "$salida" | python3 -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["languages"]))')" >> "$GITHUB_OUTPUT"
+          echo "vacio=$(echo "$salida" | python3 -c 'import json,sys;print(str(json.load(sys.stdin)["empty"]).lower())')" >> "$GITHUB_OUTPUT"
+
+  analizar:
+    name: Analizar (${{ matrix.lenguaje }})
+    needs: detectar
+    if: needs.detectar.outputs.vacio == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      security-events: write
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        lenguaje: ${{ fromJSON(needs.detectar.outputs.matriz) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.lenguaje }}
+          # security-extended añade consultas de menor severidad pero mayor
+          # cobertura; quality añade errores de corrección que suelen ser
+          # la raíz de una vulnerabilidad.
+          queries: security-extended,security-and-quality
+
+      - name: Compilación automática
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Analizar
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.lenguaje }}

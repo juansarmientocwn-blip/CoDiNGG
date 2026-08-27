@@ -1,0 +1,106 @@
+# Reglas Semgrep locales — funcionan SIN conexión al registro de semgrep.dev.
+#
+# Cuando hay red, `secops.sh codigo` prefiere `--config p/security-audit` y
+# `p/secrets`, que traen cientos de reglas mantenidas por la comunidad. Estas
+# reglas locales son el suelo mínimo garantizado: cubren las clases de fallo
+# que más se explotan en la práctica y que un escáner de dependencias no ve
+# porque están en tu propio código.
+#
+# Añade aquí las reglas propias de tu proyecto: es el sitio natural para
+# codificar "en este repositorio esto nunca se hace".
+
+rules:
+  # Ojo: una regla no puede mezclar lenguajes cuyos patrones no sean válidos en
+  # todos ellos. `new Function(...)` no es Python, así que semgrep descartaría
+  # la regla entera con un PatternParseError y dejaría de avisar también en
+  # Python. Por eso van separadas.
+  - id: eval-de-entrada-externa-python
+    languages: [python]
+    severity: ERROR
+    message: >-
+      eval() sobre datos que puede controlar un tercero permite ejecución de
+      código arbitraria. Sustitúyelo por json.loads o por un despachador explícito.
+    pattern: eval(...)
+
+  - id: eval-de-entrada-externa-js
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      eval() y new Function() sobre datos externos permiten ejecución de código
+      arbitraria. Usa JSON.parse o un despachador explícito.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+
+  - id: subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      shell=True concatenando texto externo permite inyección de comandos.
+      Pasa la orden como lista de argumentos y deja shell=False.
+    pattern: subprocess.$F(..., shell=True, ...)
+
+  - id: exec-de-cadena-construida
+    languages: [python]
+    severity: ERROR
+    message: exec() sobre una cadena construida en tiempo de ejecución es ejecución de código arbitraria.
+    pattern: exec(...)
+
+  - id: sql-por-concatenacion
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Consulta SQL construida por concatenación o interpolación: inyección SQL.
+      Usa consultas parametrizadas (cursor.execute(sql, parametros)).
+    pattern-either:
+      - pattern: $CUR.execute("..." % ...)
+      - pattern: $CUR.execute("..." + $X)
+      - pattern: $CUR.execute(f"...")
+
+  - id: verificacion-tls-desactivada
+    languages: [python]
+    severity: ERROR
+    message: >-
+      verify=False desactiva la validación del certificado TLS: la conexión
+      queda expuesta a intercepción (man-in-the-middle).
+    pattern: requests.$M(..., verify=False, ...)
+
+  - id: hash-debil-para-credenciales
+    languages: [python]
+    severity: WARNING
+    message: >-
+      MD5 y SHA-1 están rotos para cualquier uso de seguridad. Para contraseñas
+      usa bcrypt, scrypt o Argon2; para integridad, SHA-256 o superior.
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+
+  - id: aleatoriedad-no-criptografica
+    languages: [python]
+    severity: WARNING
+    message: >-
+      El módulo random es predecible. Para tokens, contraseñas, identificadores
+      de sesión o sales usa `secrets` (o os.urandom).
+    pattern-either:
+      - pattern: random.random(...)
+      - pattern: random.randint(...)
+      - pattern: random.choice(...)
+
+  - id: innerhtml-con-dato-externo
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Asignar a innerHTML texto que viene de fuera inyecta HTML y script (XSS).
+      Usa textContent, o sanea con una biblioteca como DOMPurify.
+    pattern-either:
+      - pattern: $EL.innerHTML = $X
+      - pattern: $EL.outerHTML = $X
+      - pattern: document.write(...)
+
+  - id: cookie-sin-atributos-de-seguridad
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Cookie de sesión sin httpOnly/secure: accesible desde JavaScript y
+      viajable en claro. Marca httpOnly, secure y sameSite.
+    pattern: '$RES.cookie($N, $V, {..., httpOnly: false, ...})'

@@ -1,0 +1,76 @@
+name: Remediación asistida (opcional)
+
+# ---------------------------------------------------------------------------
+#  OPCIONAL. Este es el único workflow del kit que necesita un servicio externo.
+#  Si no configuras el secreto ANTHROPIC_API_KEY, no se ejecuta nada: el resto
+#  del agente de seguridad funciona sin él.
+#
+#  Qué hace: cuando una persona con permiso de escritura pone la etiqueta
+#  `remediar` en una issue de hallazgos, Claude lee el informe, propone el
+#  arreglo y abre un pull request. NUNCA escribe en la rama principal: el
+#  arreglo pasa por revisión humana como cualquier otro PR.
+#
+#  Nota de seguridad: se dispara por ETIQUETA, no por comentario. Una etiqueta
+#  sólo la puede poner quien tiene permiso en el repositorio, así que un
+#  desconocido no puede lanzar el agente escribiendo en una issue pública.
+# ---------------------------------------------------------------------------
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  remediar:
+    name: Proponer arreglo
+    if: github.event.label.name == 'remediar'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Comprobar que hay credencial
+        id: cred
+        env:
+          CLAVE: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$CLAVE" ]; then
+            echo "::warning::No hay secreto ANTHROPIC_API_KEY configurado; se omite la remediación."
+            echo "hay=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "hay=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Claude propone el arreglo
+        if: steps.cred.outputs.hay == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Eres el agente de remediación de seguridad de este repositorio.
+
+            Contexto: la issue #${{ github.event.issue.number }} recoge hallazgos
+            del agente de seguridad (gitleaks, trivy, ClamAV, CodeQL).
+
+            Reglas estrictas:
+            1. Arregla SÓLO lo que esté descrito en la issue. Nada más.
+            2. Si el hallazgo es un secreto filtrado, NO lo borres sin más: el
+               secreto ya está comprometido. Sustitúyelo por una variable de
+               entorno y deja escrito en el PR que hay que ROTAR la credencial.
+            3. Para un CVE, sube la versión de la dependencia a la mínima
+               corregida; no cambies APIs por tu cuenta.
+            4. Ejecuta `./scripts/secops.sh --strict` antes de terminar y pega
+               la salida real en la descripción del PR.
+            5. Si no puedes verificar el arreglo, dilo explícitamente en el PR
+               en lugar de darlo por bueno.
+
+            Abre un pull request contra la rama por defecto. No hagas push
+            directo a la rama principal bajo ninguna circunstancia.

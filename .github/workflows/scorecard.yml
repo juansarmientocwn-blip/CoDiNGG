@@ -1,0 +1,52 @@
+name: OpenSSF Scorecard
+
+# ---------------------------------------------------------------------------
+#  Audita la postura de seguridad del propio repositorio (no del código):
+#  ramas protegidas, acciones fijadas por SHA, permisos de los tokens,
+#  firma de artefactos, dependencias actualizadas, etc.
+#
+#  Es la capa que detecta el agujero organizativo, no el bug de código.
+# ---------------------------------------------------------------------------
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '23 6 * * 2'
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analisis:
+    name: Análisis Scorecard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Ejecutar Scorecard
+        uses: ossf/scorecard-action@v2.4.1
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: informe-scorecard
+          path: scorecard.sarif
+          retention-days: 30
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard.sarif
+          category: scorecard

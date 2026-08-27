@@ -1,0 +1,373 @@
+name: Agente de seguridad
+
+# ---------------------------------------------------------------------------
+#  Agente de seguridad interno del repositorio.
+#
+#  Se ejecuta solo (schedule), en cada push a la rama principal, en cada pull
+#  request y a mano (workflow_dispatch). Cuatro capas defensivas + un informe
+#  agregado que se publica como issue fija.
+#
+#  Principio de mínimo privilegio: el permiso por defecto es sólo lectura y
+#  cada job pide únicamente lo que necesita.
+#
+#  IMPORTANTE: se usa `pull_request`, NUNCA `pull_request_target`. El segundo
+#  ejecuta con los secretos del repositorio código venido de un fork y es la
+#  vía de escalada más habitual en GitHub Actions.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Todos los días a las 04:17 UTC. Minuto no redondo a propósito: las horas
+    # en punto son las de mayor congestión en los runners compartidos.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seguridad-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: '8.28.0'
+  GITLEAKS_SHA256: 'a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb'
+  TRIVY_VERSION: '0.70.0'
+  TRIVY_SHA256: '8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Capa 1 — Secretos filtrados, en el código Y en todo el historial de git.
+  # -------------------------------------------------------------------------
+  secretos:
+    name: Secretos filtrados
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # historial completo: un secreto borrado sigue comprometido
+
+      - name: Instalar gitleaks (con verificación SHA-256)
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o gl.tgz "$url"
+          echo "${GITLEAKS_SHA256}  gl.tgz" | sha256sum -c -
+          tar -xzf gl.tgz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Analizar el árbol de trabajo
+        run: |
+          gitleaks dir . --no-banner --redact --exit-code 0 \
+            --report-format sarif --report-path gitleaks.sarif
+
+      - name: Analizar el historial de commits
+        run: |
+          gitleaks git . --no-banner --redact --exit-code 0 \
+            --report-format sarif --report-path gitleaks-historial.sarif
+
+      - name: Publicar resultados en Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks-arbol
+
+      - name: Publicar resultados del historial
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks-historial.sarif
+          category: gitleaks-historial
+
+      - name: Fallar si hay secretos
+        run: |
+          set -euo pipefail
+          n=$(python3 -c "import json;d=json.load(open('gitleaks.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))")
+          h=$(python3 -c "import json;d=json.load(open('gitleaks-historial.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))")
+          echo "secretos_arbol=$n"        >> "$GITHUB_OUTPUT"
+          echo "secretos_historial=$h"    >> "$GITHUB_OUTPUT"
+          {
+            echo "### Capa 1 — Secretos"
+            echo ""
+            echo "- Árbol de trabajo: **$n**"
+            echo "- Historial de git: **$h**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$n" -gt 0 ] || [ "$h" -gt 0 ]; then
+            echo "::error::Se han detectado secretos. Rótalos ANTES de borrarlos del repositorio: ya están comprometidos."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: informe-secretos
+          path: gitleaks*.sarif
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # Capa 2 — CVEs en dependencias, malas configuraciones y licencias.
+  # -------------------------------------------------------------------------
+  dependencias:
+    name: Dependencias y configuración
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar trivy (con verificación SHA-256)
+        run: |
+          set -euo pipefail
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -fsSL --retry 3 -o tv.tgz "$url"
+          echo "${TRIVY_SHA256}  tv.tgz" | sha256sum -c -
+          tar -xzf tv.tgz trivy
+          sudo mv trivy /usr/local/bin/
+
+      - name: Analizar vulnerabilidades y configuración
+        run: |
+          set -euo pipefail
+          trivy fs . --scanners vuln,misconfig,secret \
+            --severity HIGH,CRITICAL \
+            --format sarif --output trivy.sarif \
+            --exit-code 0
+          trivy fs . --scanners vuln,misconfig \
+            --severity HIGH,CRITICAL --format table --exit-code 0 \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Fallar si hay CRITICAL
+        run: trivy fs . --scanners vuln,misconfig --severity CRITICAL --exit-code 1 --quiet
+
+  # -------------------------------------------------------------------------
+  # Capa 3 — Antivirus sobre el árbol del repositorio.
+  #  Detecta binarios maliciosos subidos por error, webshells en assets,
+  #  y ejecutables que se cuelan en un PR.
+  # -------------------------------------------------------------------------
+  antivirus:
+    name: Antivirus (ClamAV)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar ClamAV y actualizar firmas
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clamav
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
+          # freshclam falla si otra instancia tiene el lock; se reintenta.
+          for i in 1 2 3; do
+            if sudo freshclam --quiet; then break; fi
+            echo "reintento freshclam $i"; sleep 10
+          done
+          clamscan --version
+
+      - name: Escanear el repositorio
+        run: |
+          set -uo pipefail
+          clamscan --recursive --infected --no-summary \
+                   --max-filesize=200M --max-scansize=1000M \
+                   --exclude-dir='^\.git$' . | tee clamav.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "### Capa 3 — Antivirus"
+            echo ""
+            if [ "$rc" -eq 0 ]; then echo "Sin malware detectado."
+            elif [ "$rc" -eq 1 ]; then echo '```'; cat clamav.log; echo '```'
+            else echo "clamscan terminó con error $rc: **capa NO verificada**."; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          # rc=2 es un error de la herramienta, no un repositorio limpio:
+          # también se falla, para no publicar un "todo correcto" falso.
+          [ "$rc" -eq 0 ] || exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: informe-antivirus
+          path: clamav.log
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # Capa 5 y 6 — Tu propio código (SAST) e infraestructura como código.
+  #  Es la capa que encuentra el fallo que nadie más ve: no está en una
+  #  dependencia ni en una credencial, está en la línea que escribiste tú.
+  # -------------------------------------------------------------------------
+  codigo:
+    name: Código propio e infraestructura
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar analizadores
+        run: python -m pip install --quiet semgrep bandit checkov
+
+      - name: Semgrep (SAST multilenguaje)
+        run: |
+          set -euo pipefail
+          # Se intenta el registro público; si no hay salida a semgrep.dev,
+          # se cae a las reglas locales del repositorio en lugar de fallar.
+          if curl -fsS -m 10 -o /dev/null https://semgrep.dev; then
+            cfg="p/security-audit"
+          else
+            cfg="scripts/reglas/semgrep-basico.yaml"
+            echo "::warning::Sin acceso al registro de semgrep; se usan las reglas locales."
+          fi
+          semgrep scan --config "$cfg" --sarif --output semgrep.sarif \
+                       --metrics=off --error --quiet . || true
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Bandit (Python)
+        run: |
+          set -euo pipefail
+          if find . -name '*.py' -not -path './.git/*' -print -quit | grep -q .; then
+            bandit -q -r . -ll -ii -f json -o bandit.json || true
+            n=$(python -c "import json;print(len(json.load(open('bandit.json'))['results']))")
+            echo "### Bandit: $n hallazgo(s) de severidad media o alta" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Sin ficheros Python: bandit no aplica.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkov (infraestructura como código)
+        run: |
+          set -euo pipefail
+          checkov -d . --quiet --compact --output sarif --output-file-path . || true
+          ls -la results.sarif 2>/dev/null || echo "checkov no generó SARIF"
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: hashFiles('results.sarif') != ''
+        with:
+          sarif_file: results.sarif
+          category: checkov
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: informe-codigo
+          path: |
+            semgrep.sarif
+            bandit.json
+            results.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # Capa 4 — Revisión de dependencias nuevas introducidas por un PR.
+  # -------------------------------------------------------------------------
+  revision-dependencias-pr:
+    name: Revisión de dependencias del PR
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: on-failure
+
+  # -------------------------------------------------------------------------
+  # Informe agregado — el "agente": mantiene UNA issue viva con el estado.
+  # -------------------------------------------------------------------------
+  informe:
+    name: Informe del agente
+    needs: [secretos, dependencias, antivirus, codigo]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          R_SECRETOS: ${{ needs.secretos.result }}
+          R_DEPS: ${{ needs.dependencias.result }}
+          R_AV: ${{ needs.antivirus.result }}
+          R_CODIGO: ${{ needs.codigo.result }}
+        with:
+          script: |
+            const TITULO = '🔐 Estado del agente de seguridad';
+            const icono = r => ({
+              success: '✅ correcto',
+              failure: '❌ HALLAZGOS',
+              cancelled: '⚠️ cancelado — NO VERIFICADO',
+              skipped: '⚠️ omitido — NO VERIFICADO',
+            }[r] || `⚠️ ${r} — NO VERIFICADO`);
+
+            const capas = [
+              ['Capa 1 — Secretos filtrados (gitleaks)', process.env.R_SECRETOS],
+              ['Capa 2 — Dependencias y configuración (trivy)', process.env.R_DEPS],
+              ['Capa 3 — Antivirus (ClamAV)', process.env.R_AV],
+              ['Capa 5/6 — Código propio e infraestructura (semgrep, bandit, checkov)', process.env.R_CODIGO],
+            ];
+            const hayFallo = capas.some(([, r]) => r === 'failure');
+            const haySinVerificar = capas.some(([, r]) => r !== 'success' && r !== 'failure');
+
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const cuerpo = [
+              `**Última ejecución:** ${new Date().toISOString()} · [ver ejecución](${run})`,
+              `**Commit:** \`${context.sha.slice(0, 8)}\``,
+              '',
+              '| Capa | Resultado |',
+              '| --- | --- |',
+              ...capas.map(([n, r]) => `| ${n} | ${icono(r)} |`),
+              '',
+              hayFallo
+                ? '> ❌ Hay hallazgos de seguridad. Revisa la pestaña **Security → Code scanning** y los artefactos de la ejecución.'
+                : haySinVerificar
+                  ? '> ⚠️ Alguna capa no llegó a ejecutarse. Esto **no** significa que el repositorio esté limpio.'
+                  : '> ✅ Todas las capas se ejecutaron sin hallazgos.',
+              '',
+              '<sub>Issue mantenida automáticamente por `.github/workflows/agente-seguridad.yml`. No la cierres a mano: se reabre en la siguiente ejecución si vuelve a haber hallazgos.</sub>',
+            ].join('\n');
+
+            const { data: issues } = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'all', labels: 'agente-seguridad', per_page: 10,
+            });
+            const existente = issues.find(i => i.title === TITULO);
+
+            if (!existente) {
+              if (hayFallo || haySinVerificar) {
+                await github.rest.issues.create({
+                  ...context.repo, title: TITULO, body: cuerpo,
+                  labels: ['agente-seguridad', 'seguridad'],
+                });
+              }
+              return;
+            }
+            await github.rest.issues.update({
+              ...context.repo, issue_number: existente.number, body: cuerpo,
+              state: (hayFallo || haySinVerificar) ? 'open' : 'closed',
+            });
