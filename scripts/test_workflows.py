@@ -52,7 +52,7 @@ def prueba_yaml() -> int:
     objetivos.append(os.path.join(BASE, "dependabot.yml"))
     for f in objetivos:
         try:
-            doc = yaml.safe_load(open(f))
+            doc = yaml.safe_load(open(f, encoding="utf-8"))
             assert isinstance(doc, dict) and doc, "documento vacío"
             print(f"[OK  ] YAML válido: {os.path.relpath(f, RAIZ)}")
         except Exception as e:  # noqa: BLE001
@@ -76,7 +76,7 @@ def prueba_permisos() -> int:
     for f in sorted(os.listdir(WF)):
         ruta = os.path.join(WF, f)
         try:
-            doc = yaml.safe_load(open(ruta))
+            doc = yaml.safe_load(open(ruta, encoding="utf-8"))
         except yaml.YAMLError as e:
             # Ya lo reportó prueba_yaml con detalle; aquí sólo se cuenta, sin
             # dejar que una traza de Python oculte el resto de comprobaciones.
@@ -166,7 +166,7 @@ process.exit(fallos ? 1 : 0);
 
 
 def prueba_informe() -> int:
-    doc = yaml.safe_load(open(os.path.join(WF, "agente-seguridad.yml")))
+    doc = yaml.safe_load(open(os.path.join(WF, "agente-seguridad.yml"), encoding="utf-8"))
     js = doc["jobs"]["informe"]["steps"][0]["with"]["script"]
 
     datos = [{"n": n, "issues": i, "r": r, "espera": e} for n, i, r, e in ESCENARIOS]

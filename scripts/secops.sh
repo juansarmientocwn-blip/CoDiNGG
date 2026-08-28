@@ -130,6 +130,38 @@ py_run() { # fragmento [args...] -> imprime el resultado, o -1 si no se puede co
   $PY -c "$@" 2>/dev/null || printf '%s\n' -1
 }
 
+# --- Contador de respaldo, sin Python --------------------------------------
+#  Sin intérprete de Python las capas 1 y 2 quedaban NO VERIFICADO aunque el
+#  escáner hubiese corrido bien y hubiese dejado su informe: lo que faltaba no
+#  era el análisis, era poder contar los hallazgos. Eso es un falso "no lo sé"
+#  y es tan dañino como un falso "está limpio".
+#
+#  Este contador no es un parser de JSON general; cuenta una clave que aparece
+#  exactamente una vez por hallazgo en los dos formatos concretos que se usan
+#  aquí (SARIF de gitleaks, JSON de trivy). Devuelve -1 si el fichero no existe
+#  o no empieza como JSON, de modo que la capa siga cayendo a NO VERIFICADO
+#  cuando de verdad no hay nada que leer.
+contar_grep() { # fichero clave_json
+  local f="$1" pat="$2" n
+  if [ ! -s "$f" ]; then printf '%s\n' -1; return 0; fi
+  if ! head -c 1 "$f" | grep -q '[[{]'; then printf '%s\n' -1; return 0; fi
+  n="$(grep -o -- "$pat" "$f" 2>/dev/null | wc -l | tr -d ' [:space:]')"
+  printf '%s\n' "${n:-0}"
+}
+
+
+# --- Rutas para el Python de Windows ---------------------------------------
+#  En Git Bash las rutas son estilo MSYS (/c/Users/...). Un python.exe nativo de
+#  Windows no las resuelve: json.load() lanza FileNotFoundError, py_run devuelve
+#  -1 y la capa queda NO VERIFICADO aunque el escáner haya corrido y dejado su
+#  informe. Es el mismo falso "no lo sé" que arregla contar_grep, por otra vía.
+ruta_py() { # ruta -> ruta que el intérprete pueda abrir
+  if [ "$SECOPS_SO" = "windows" ] && command -v cygpath >/dev/null 2>&1; then
+    cygpath -m "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
 descargar() { # url destino sha256
   local url="$1" dest="$2" sha="$3" tmp
   tmp="$(mktemp)"
@@ -207,13 +239,29 @@ capa_secretos() {
   log "Capa 1/6 — Secretos filtrados (gitleaks)"
   local bin; bin="$(bin_path gitleaks)" || { sin_verificar "secretos" "gitleaks no instalado (ejecuta --install)"; return; }
 
-  local args=(dir "$REPO_ROOT" --no-banner --redact
+  # $WORKDIR guarda los binarios de los propios escáneres y, si se instala ahí un
+  # intérprete, miles de ficheros de terceros con claves de ejemplo (botocore,
+  # ecdsa, license_expression...). Analizarlos produce cientos de falsos
+  # positivos que sepultan un hallazgo real: un escáner que grita 356 veces deja
+  # de leerse, y esa es la peor forma de perder una alerta legítima. trivy ya se
+  # excluye con --skip-dirs; gitleaks necesita una allowlist explícita.
+  local cfg="$WORKDIR/gitleaks.toml"
+  cat > "$cfg" <<'TOML'
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Directorio de trabajo de secops (binarios de los propios escáneres)"
+paths = ['(^|/)\.secops/']
+TOML
+
+  local args=(dir "$REPO_ROOT" --no-banner --redact --config "$(ruta_py "$cfg")"
               --report-format sarif --report-path "$REPORTS/gitleaks.sarif"
               --exit-code 0)
   # Si es un repositorio git, se analiza también el historial completo: un secreto
   # borrado en un commit posterior sigue siendo un secreto comprometido.
   if [ -d "$REPO_ROOT/.git" ]; then
-    "$bin" git "$REPO_ROOT" --no-banner --redact \
+    "$bin" git "$REPO_ROOT" --no-banner --redact --config "$(ruta_py "$cfg")" \
       --report-format sarif --report-path "$REPORTS/gitleaks-historial.sarif" \
       --exit-code 0 >/dev/null 2>&1 || true
   fi
@@ -222,9 +270,10 @@ capa_secretos() {
   local n; n="$(py_run "
 import json,sys
 try:
-    d=json.load(open('$REPORTS/gitleaks.sarif'))
+    d=json.load(open(r'$(ruta_py "$REPORTS/gitleaks.sarif")'))
     print(sum(len(r.get('results',[])) for r in d.get('runs',[])))
 except Exception: print(-1)")"
+  if [ "$n" -lt 0 ]; then n="$(contar_grep "$REPORTS/gitleaks.sarif" '"ruleId"')"; fi
   if [ "$n" -lt 0 ]; then sin_verificar "secretos" "gitleaks no produjo un SARIF legible${SIN_PY}"; return; fi
   if [ "$n" -gt 0 ]; then
     c_red "  $n secreto(s) detectado(s) -> $REPORTS/gitleaks.sarif"
@@ -255,12 +304,14 @@ except Exception: print(-1)'
       --format json --output "$REPORTS/trivy-vuln.json" \
       ${TRIVY_DB_REPOSITORY:+--db-repository "$TRIVY_DB_REPOSITORY"} \
       --exit-code 0 --skip-dirs "$WORKDIR" >"$REPORTS/trivy-vuln.log" 2>&1 || true
-  local nv; nv="$(py_run "$contar" "$REPORTS/trivy-vuln.json" 2>/dev/null || echo -1)"
+  local nv; nv="$(py_run "$contar" "$(ruta_py "$REPORTS/trivy-vuln.json")" 2>/dev/null || echo -1)"
+  if [ "$nv" -lt 0 ]; then nv="$(contar_grep "$REPORTS/trivy-vuln.json" '"VulnerabilityID"')"; fi
 
   "$bin" fs "$REPO_ROOT" --scanners misconfig --severity HIGH,CRITICAL \
       --format json --output "$REPORTS/trivy-misconfig.json" \
       --exit-code 0 --skip-dirs "$WORKDIR" >"$REPORTS/trivy-misconfig.log" 2>&1 || true
-  local nm; nm="$(py_run "$contar" "$REPORTS/trivy-misconfig.json" 2>/dev/null || echo -1)"
+  local nm; nm="$(py_run "$contar" "$(ruta_py "$REPORTS/trivy-misconfig.json")" 2>/dev/null || echo -1)"
+  if [ "$nm" -lt 0 ]; then nm="$(contar_grep "$REPORTS/trivy-misconfig.json" '"AVDID"')"; fi
 
   if [ "$nv" -lt 0 ]; then
     sin_verificar "dependencias (CVE)" "trivy no pudo descargar la base de vulnerabilidades, o no se pudo leer el JSON${SIN_PY} (ver $REPORTS/trivy-vuln.log)"
@@ -305,8 +356,13 @@ capa_malware() {
   fi
 
   set +e
+  # Los patrones se dan por NOMBRE de directorio, no por ruta absoluta. El patrón
+  # anterior anclaba una ruta estilo MSYS (^/c/Users/...) que clamscan.exe nunca
+  # llega a ver: recibe C:/Users/... y el patrón no casaba, así que no excluía
+  # nada y el antivirus acababa escaneándose a sí mismo — 9m37s en lugar de 10s,
+  # analizando además código de terceros que no pertenece al repositorio.
   "$bin" "${dbargs[@]}" --recursive --infected --no-summary \
-        --exclude-dir="^${WORKDIR}" --exclude-dir="^${REPO_ROOT}/.git$" \
+        --exclude-dir="$(basename "$WORKDIR")" --exclude-dir="[.]git" \
         "$REPO_ROOT" >"$REPORTS/clamav.log" 2>&1
   local rc=$?
   set -e
@@ -341,7 +397,7 @@ capa_codigo() {
     local ns; ns="$(py_run "
 import json,sys
 try:
-    d=json.load(open('$REPORTS/semgrep.json'))
+    d=json.load(open(r'$(ruta_py "$REPORTS/semgrep.json")'))
     print(len(d.get('errors',[])) and -1 or len(d['results']))
 except Exception: print(-1)")"
     if [ "$ns" -lt 0 ]; then
@@ -368,7 +424,7 @@ except Exception: print(-1)")"
             -f json -o "$REPORTS/bandit.json" >/dev/null 2>&1 || true
       local nb; nb="$(py_run "
 import json
-try: print(len(json.load(open('$REPORTS/bandit.json'))['results']))
+try: print(len(json.load(open(r'$(ruta_py "$REPORTS/bandit.json")'))['results']))
 except Exception: print(-1)")"
       if [ "$nb" -lt 0 ]; then
         sin_verificar "código (bandit)" "bandit no produjo un JSON legible${SIN_PY}"
@@ -395,7 +451,7 @@ capa_iac() {
   local n; n="$(py_run "
 import json
 try:
-    d=json.load(open('$REPORTS/checkov.json'))
+    d=json.load(open(r'$(ruta_py "$REPORTS/checkov.json")'))
     d=d if isinstance(d,list) else [d]
     print(sum(len(x.get('results',{}).get('failed_checks',[])) for x in d))
 except Exception: print(-1)")"
