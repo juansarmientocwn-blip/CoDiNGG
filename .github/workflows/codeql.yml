@@ -35,7 +35,7 @@ jobs:
       matriz: ${{ steps.det.outputs.matriz }}
       vacio: ${{ steps.det.outputs.vacio }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: det
         run: |
           set -euo pipefail
@@ -59,7 +59,7 @@ jobs:
       matrix:
         lenguaje: ${{ fromJSON(needs.detectar.outputs.matriz) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Inicializar CodeQL
         uses: github/codeql-action/init@v3
