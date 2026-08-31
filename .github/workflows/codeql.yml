@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Inicializar CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.lenguaje }}
           # security-extended añade consultas de menor severidad pero mayor
@@ -71,9 +71,9 @@ jobs:
           queries: security-extended,security-and-quality
 
       - name: Compilación automática
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@v4
 
       - name: Analizar
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: /language:${{ matrix.lenguaje }}
